@@ -2,7 +2,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from utils import calculate_time_to_expiry, black_scholes_call, black_scholes_put, calculate_delta
+from utils import calculate_time_to_expiry, black_scholes_call, black_scholes_put, calculate_delta, calculate_implied_volatility
 
 RISK_FREE_RATE = 0.045  # Approx 4.5%
 
@@ -27,7 +27,7 @@ class SPYScanner:
     def get_expirations(self):
         return self.stock.options
 
-    def scan_options(self, expirations_to_scan=3, min_volume=100, money_range_pct=0.05, expiry_filter=None):
+    def scan_options(self, expirations_to_scan=3, min_volume=100, money_range_pct=0.05, expiry_filter=None, min_days_to_expiry=None):
         """
         Scan options for the next few expirations.
         
@@ -36,6 +36,7 @@ class SPYScanner:
             min_volume (int): Filter out illiquid options.
             money_range_pct (float): Only look at strikes within +/- X% of spot price.
             expiry_filter (str): Optional string to filter expirations (e.g., "2028-01").
+            min_days_to_expiry (int): Optional, only scan expirations > X days away.
         """
         if self.current_price is None:
             self.fetch_current_price()
@@ -43,15 +44,24 @@ class SPYScanner:
         all_options = []
         available_expirations = self.get_expirations()
         
-        # Filter Expirations if requested
+        # Filter Expirations
+        target_expirations = []
+        
         if expiry_filter:
             target_expirations = [e for e in available_expirations if expiry_filter in e]
-            if not target_expirations:
-                print(f"No expirations found matching '{expiry_filter}'. Available: {available_expirations}")
-                return pd.DataFrame()
+        elif min_days_to_expiry:
+            # Filter dynamically by days
+            for exp in available_expirations:
+                days = calculate_time_to_expiry(exp) * 365
+                if days >= min_days_to_expiry:
+                    target_expirations.append(exp)
         else:
             # Limit to the requested number of expirations
             target_expirations = available_expirations[:expirations_to_scan]
+        
+        if not target_expirations:
+             print(f"No expirations found matching criteria.")
+             return pd.DataFrame()
         
         print(f"Scanning expirations: {target_expirations}")
         print(f"Current {self.ticker_symbol} Price: ${self.current_price:.2f}")
@@ -86,49 +96,86 @@ class SPYScanner:
                 
                 # --- Cheapness Logic ---
                 
-                # 1. Calculate ATM Volatility for this expiry (approximate)
-                # Find strike closest to current price
-                atm_strike = chain.iloc[(chain['strike'] - self.current_price).abs().argsort()[:1]]
-                if not atm_strike.empty:
-                    atm_iv = atm_strike['impliedVolatility'].values[0]
+                # 1. Calculate Robust ATM Volatility
+                # yfinance often returns 0 or NaN for IV on illiquid LEAPS.
+                # We typically want the "Average IV" of strikes near the money.
+                
+                # Filter for "Near-the-Money" options (within 5%) that have VALID IV (> 1%)
+                valid_iv_options = chain[
+                    (chain['strike'] >= self.current_price * 0.95) & 
+                    (chain['strike'] <= self.current_price * 1.05) & 
+                    (chain['impliedVolatility'] > 0.01)
+                ]
+                
+                if not valid_iv_options.empty:
+                    atm_iv = valid_iv_options['impliedVolatility'].mean()
                 else:
-                    atm_iv = 0.20 # Fallback default
+                    # Fallback: Look wider (10%)
+                    valid_iv_options_wide = chain[
+                        (chain['strike'] >= self.current_price * 0.90) & 
+                        (chain['strike'] <= self.current_price * 1.10) & 
+                        (chain['impliedVolatility'] > 0.01)
+                    ]
+                    if not valid_iv_options_wide.empty:
+                        atm_iv = valid_iv_options_wide['impliedVolatility'].mean()
+                    else:
+                         # Last resort fallback (e.g., historical avg for SPY ~15-20%)
+                         # This prevents the "Delta 1.0" issue when data is missing.
+                        atm_iv = 0.15 
                 
                 chain['atm_iv_ref'] = atm_iv
                 
-                # 2. Check for "High Value" (Low IV relative to ATM)
-                # We calculate what the price WOULD be if it had ATM IV
-                # Then Compare Market Price vs ATM-IV Price.
-                # If Market Price < ATM-IV Price, it implies the option's specific IV is lower than ATM.
-                
                 bs_prices = []
                 deltas = []
+                recalc_ivs = []
+                
                 for index, row in chain.iterrows():
-                    sigma = row['atm_iv_ref'] # Use the "Benchmark" IV
+                    # Use ASK Price just for valuation if available (Buyer's perspective)
+                    ask_price = row.get('ask', 0)
+                    bid_price = row.get('bid', 0)
+                    last_price = row['lastPrice']
                     
-                    # Calculate Theoretical Price & Delta
-                    # For Delta, we generally use the option's OWN implied volatility to get the "Market Delta",
-                    # but using ATM IV gives a "Theoretical Delta". 
-                    # Users usually want "Market Delta" (what brokers show). 
-                    # Let's use the option's own IV for Delta if available, otherwise ATM.
-                    delta_sigma = row['impliedVolatility'] if row['impliedVolatility'] > 0 else sigma
+                    # PRIORITY: Ask > Last
+                    if ask_price > 0:
+                        market_price = ask_price
+                    else:
+                        market_price = last_price
                     
-                    delta = calculate_delta(self.current_price, row['strike'], T, RISK_FREE_RATE, delta_sigma, row['type'])
+                    # Save for display
+                    chain.at[index, 'priceUsed'] = market_price
+                    
+                    strike = row['strike']
+                    otype = row['type']
+                    
+                    # A. Back-solve Implied Volatility from Market Price
+                    calc_iv = calculate_implied_volatility(market_price, self.current_price, strike, T, RISK_FREE_RATE, otype)
+                    
+                    # Sanity check
+                    if calc_iv <= 0.001 or calc_iv >= 4.9:
+                         iv_to_use = atm_iv
+                    else:
+                         iv_to_use = calc_iv
+                         
+                    recalc_ivs.append(iv_to_use)
+                    
+                    # B. Calculate Greeks with THIS IV
+                    delta = calculate_delta(self.current_price, strike, T, RISK_FREE_RATE, iv_to_use, otype)
                     deltas.append(delta)
 
-                    if row['type'] == 'call':
-                        theo = black_scholes_call(self.current_price, row['strike'], T, RISK_FREE_RATE, sigma)
+                    # C. Calculate "Theoretical" Price using ATM Volatility
+                    if otype == 'call':
+                        theo = black_scholes_call(self.current_price, strike, T, RISK_FREE_RATE, atm_iv)
                     else:
-                        theo = black_scholes_put(self.current_price, row['strike'], T, RISK_FREE_RATE, sigma)
+                        theo = black_scholes_put(self.current_price, strike, T, RISK_FREE_RATE, atm_iv)
                     bs_prices.append(theo)
                 
+                # Update DataFrame with our calculated values
+                chain['impliedVolatility'] = recalc_ivs
                 chain['theo_price_at_atm_iv'] = bs_prices
                 chain['delta'] = deltas
                 
-                # Discount: How much cheaper is the market price compared to the theoretical price at ATM IV?
-                # Positive number means Market is CHEAPER than Theoretical (Good for buying)
-                chain['discount_amt'] = chain['theo_price_at_atm_iv'] - chain['lastPrice']
-                chain['discount_pct'] = (chain['discount_amt'] / chain['lastPrice']) * 100
+                # Discount: (Theo - PriceUsed) / PriceUsed * 100
+                chain['discount_pct'] = (chain['theo_price_at_atm_iv'] - chain['priceUsed']) / chain['priceUsed'] * 100
                 
                 all_options.append(chain)
                 
